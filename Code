@@ -1,0 +1,1400 @@
+library(tidyverse)
+library(naniar)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(survey)
+library(rafalib)
+library(modelr)
+library(na.tools)
+library(ggimage)
+library(ggrepel)
+library(remotes)
+library(glue)
+
+options(scipen = 4)
+
+first <- 2009 # first season to grab. min available = 2009
+last <- 2019 # most recent season
+datalist = list()
+for (yr in first:last) {
+  pbp <- read_csv(url(paste0("https://github.com/ryurko/nflscrapR-data/raw/master/play_by_play_data/regular_season/reg_pbp_", yr, ".csv")))
+  games <- read_csv(url(paste0("https://raw.githubusercontent.com/ryurko/nflscrapR-data/master/games_data/regular_season/reg_games_", yr, ".csv")))
+  pbp <- pbp %>% inner_join(games %>% distinct(game_id, week, season)) %>% select(-c(lateral_receiver_player_id, fumble_recovery_2_yards, blocked_player_id, fumble_recovery_2_player_id))
+  datalist[[yr]] <- pbp # add it to your list
+}
+pbp_all <- dplyr::bind_rows(datalist)
+## Had to remove the columns that were logical instead of character
+# NOTE: sp column means scoring play
+
+pbp_all <- pbp_all %>% 
+  mutate_at(vars(home_team, away_team, posteam, defteam), funs(case_when(
+    . %in% "JAX" ~ "JAC",
+    . %in% "STL" ~ "LA",
+    . %in% "SD" ~ "LAC",
+    TRUE ~ .
+  ))) 
+
+pbp_all_NoTimeouts <- pbp_all %>% filter(timeout == 0)
+
+pbp_all_NoTimeouts$play_id <- 1:nrow(pbp_all_NoTimeouts)
+
+# Note: data entry errors happen, e.g. Brady Quinn completed pass in 2nd qtr of
+# 2009 CLE-MIN Week 1 game was wrongly labelled as timeout
+
+# Another error, same game: extra point after Cribbs TD in 2nd qtr was omitted
+# Many more happened too (no need to write all here)
+
+# REMOVE ALL PATs to account for the bad pre-2018 data entry method,
+# also remove kickoffs too (kick return TDs screw up the labelling of drives)
+pbp_all_NoTimeoutsOrPATsOrKickoffs <- pbp_all_NoTimeouts %>%
+  filter(!is.na(down) & extra_point_attempt == 0 & two_point_attempt == 0 & kickoff_attempt == 0)
+pbp_all_NoTimeoutsOrPATsOrKickoffs$play_id <- 1:nrow(pbp_all_NoTimeoutsOrPATsOrKickoffs)
+
+pbp_all_ProjectPlays <- pbp_all_NoTimeoutsOrPATsOrKickoffs
+
+## Create drive_start and drive_end columns, using mutate
+
+pbp_all_ProjectPlays <- pbp_all_ProjectPlays %>% group_by(game_id, drive) %>% 
+  mutate(FirstPlayOfDrive = as.numeric(play_id == min(play_id))) %>% 
+  ungroup()
+
+pbp_all_ProjectPlays <- pbp_all_ProjectPlays %>% group_by(game_id, drive) %>% 
+  mutate(LastPlayOfDrive = as.numeric(play_id == max(play_id))) %>% 
+  ungroup()
+# Keep in mind, one-play drives fall in both categories
+
+# Make column for last play of half
+pbp_all_ProjectPlays <- pbp_all_ProjectPlays %>% group_by(game_id, game_half) %>% 
+  mutate(LastPlayOfHalf = as.numeric(play_id == max(play_id))) %>% 
+  ungroup()
+
+# Drive 11 of game_id 2010101004 is data entry error, play_id 47349 wrongly marked as touchdown
+view(pbp_all_ProjectPlays %>% filter(game_id == 2010101004))
+pbp_all_ProjectPlays[47349, "touchdown"] <- 0
+pbp_all_ProjectPlays[47349, "pass_touchdown"] <- 0
+pbp_all_ProjectPlays[47349, "td_team"] <- NA
+
+view(pbp_all_ProjectPlays %>% filter(game_id == 2016121700))
+pbp_all_ProjectPlays[300066, "half_seconds_remaining"] <- 920
+pbp_all_ProjectPlays[300066, "game_seconds_remaining"] <- 2720
+pbp_all_ProjectPlays[300066, "qtr"] <- 1
+# DATA ENTRY ERROR, Ajayi run should be 0:20 left in 1st quarter
+
+PENALTIES_NoPassAtt <- pbp_all_ProjectPlays %>% filter(penalty > 0 & pass_attempt < 1)
+PENALTIES_WrongLabel_Logical <- str_detect(PENALTIES_NoPassAtt$desc, "(pass) | (sack)")
+PENALTIES_WrongLabel <- PENALTIES_NoPassAtt[PENALTIES_WrongLabel_Logical, ]
+PENALTIES_WrongLabel_PlayIDVec <- PENALTIES_WrongLabel$play_id
+pbp_all_ProjectPlays[PENALTIES_WrongLabel_PlayIDVec, "pass_attempt"] <- 1
+# MAJOR DATA ENTRY ERROR - MANY OF THESE SHOULD BE LABELED AS PASS ATTEMPTS
+
+PuntReturnTDs <- pbp_all_ProjectPlays %>% 
+  filter(play_type == "punt" & !is.na(td_team) & td_team != posteam)
+PuntReturnTDVector <- PuntReturnTDs$play_id
+
+PuntOffensiveTDs <- pbp_all_ProjectPlays %>% 
+  filter(play_type == "punt" & !is.na(td_team) & td_team == posteam)
+PuntOffensiveTDsVector <- PuntOffensiveTDs$play_id
+
+FGReturnTDs <- pbp_all_ProjectPlays %>%
+  filter( (field_goal_result == "missed" | field_goal_result == "blocked") & !is.na(td_team))
+FGReturnTDVector <- FGReturnTDs$play_id
+
+AllSpecialTDs <- pbp_all_ProjectPlays %>% 
+  filter( (play_type == "kickoff" | play_type == "punt" | 
+             field_goal_result == "missed" | field_goal_result == "blocked") & !is.na(td_team))
+AllSpecialTDVector <- AllSpecialTDs$play_id
+
+OffensiveTDs <- pbp_all_ProjectPlays %>%
+  filter(pass_touchdown == 1 | rush_touchdown == 1 | 
+           ( !play_id %in% AllSpecialTDVector & !is.na(td_team) & posteam_score_post > posteam_score) )
+OffensiveTDsVector <- OffensiveTDs$play_id
+
+DefensiveTDs <- pbp_all_ProjectPlays %>%
+  filter(!is.na(td_team) & !play_id %in% OffensiveTDsVector & !play_id %in% AllSpecialTDVector)
+DefensiveTDsVector <- DefensiveTDs$play_id
+
+pbp_all_ProjectPlays <- pbp_all_ProjectPlays %>% 
+  mutate(Kneeldown = (ifelse(play_type == "qb_kneel" & qb_kneel == 1, 1, 0)),
+         PassAtt = (ifelse(pass_attempt == 1, 1, 0)),
+         Punt = (ifelse(punt_attempt == 1, 1, 0)),
+         NoScorePunt = (ifelse(punt_attempt == 1 & is.na(td_team), 1, 0)),
+         PuntReturnTD = (ifelse(play_id %in% PuntReturnTDVector, 1, 0)),
+         FGReturnTD = (ifelse(play_id %in% FGReturnTDVector, 1, 0)),
+         SpecialTD = (ifelse(play_id %in% AllSpecialTDVector, 1, 0)),
+         OffensiveTD = (ifelse(play_id %in% OffensiveTDsVector, 1, 0)),
+         DefensiveTD = (ifelse(play_id %in% DefensiveTDsVector, 1, 0)),
+         MadeFG = (ifelse( (field_goal_result == "made" & field_goal_attempt == 1), 1, 0)),
+         Turnover = (ifelse( ((interception == 1 & fumble_lost == 0) | 
+                                (interception == 0 & punt_attempt == 0 & fumble_lost == 1)), 1, 0)),
+         NoScoreTurnover = (ifelse( is.na(td_team) & ((interception == 1 & fumble_lost == 0) | 
+                                                        (interception == 0 & punt_attempt == 0 & fumble_lost == 1)), 1, 0)),
+         GRAPHTimeouts = case_when(posteam_timeouts_remaining == 0 ~ "Timeouts = 0",
+                                   posteam_timeouts_remaining == 1 ~ "Timeouts = 1",
+                                   posteam_timeouts_remaining == 2 ~ "Timeouts = 2",
+                                   posteam_timeouts_remaining == 3 ~ "Timeouts = 3"))
+
+pbp_all_ProjectPlays <- pbp_all_ProjectPlays %>%
+  mutate(NetPoints = (7 * OffensiveTD) - (7 * DefensiveTD) 
+         - (7 * SpecialTD) + (3 * MadeFG) - (2 * safety))
+
+# Now only take last 2 min of each half
+pbp_all_ProjectPlays_LateFirstHalf <- pbp_all_ProjectPlays %>% 
+  filter(half_seconds_remaining <= 120, game_half == "Half1")
+
+pbp_all_ProjectPlays_LateFirstHalf$half_seconds_remaining <- 
+  ifelse((pbp_all_ProjectPlays_LateFirstHalf$half_seconds_remaining) > 0, 
+         (pbp_all_ProjectPlays_LateFirstHalf$half_seconds_remaining), 1)
+
+pbp_all_ProjectPlays_LateFirstHalf$quarter_seconds_remaining <- 
+  ifelse((pbp_all_ProjectPlays_LateFirstHalf$quarter_seconds_remaining) > 0, 
+         (pbp_all_ProjectPlays_LateFirstHalf$quarter_seconds_remaining), 1)
+
+pbp_all_ProjectPlays_LateFirstHalf$game_seconds_remaining <- 
+  ifelse((pbp_all_ProjectPlays_LateFirstHalf$game_seconds_remaining) > 1800, 
+         (pbp_all_ProjectPlays_LateFirstHalf$game_seconds_remaining), 1801)
+
+pbp_all_ProjectPlays_LateFirstHalf <- pbp_all_ProjectPlays_LateFirstHalf %>%
+  mutate(TimeBin = ifelse(half_seconds_remaining <= 20, "0:01 to 0:20", 
+                          ifelse(half_seconds_remaining %in% 21:40, "0:21 to 0:40", 
+                                 ifelse(half_seconds_remaining %in% 41:60, "0:41 to 1:00", "Over 1:00"))))
+
+pbp_all_ProjectPlays_LateFirstHalf_OwnTerritory <- pbp_all_ProjectPlays_LateFirstHalf %>%
+  filter(yardline_100 >= 51)
+
+pbp_all_ProjectPlays_LateFirstHalf_OwnTerritory <- pbp_all_ProjectPlays_LateFirstHalf_OwnTerritory %>%
+  mutate(PositionBin = ifelse(yardline_100 >= 91, "0-9", 
+                              ifelse(yardline_100 %in% 81:90, "10s", 
+                                     ifelse(yardline_100 %in% 71:80, "20s",
+                                            ifelse(yardline_100 %in% 61:70, "30s", "40s")))))
+
+ProjectPlays_NoKNEELS_LateFirstHalf_OwnTerritory <- 
+  pbp_all_ProjectPlays_LateFirstHalf_OwnTerritory %>% filter(Kneeldown == 0)
+
+# Mean EPA occurrence 1
+PointsScoredOnDriveTable <- pbp_all_ProjectPlays_LateFirstHalf %>% 
+  group_by(game_id, drive) %>%
+  summarize(NetPoints = (7 * sum(OffensiveTD)) - (7 * sum(DefensiveTD)) 
+            - (7 * sum(SpecialTD)) + (3 * sum(MadeFG)) - (2 * sum(safety)),
+            ADJUSTEDNetPoints = (7 * sum(OffensiveTD)) - (7 * sum(DefensiveTD)) 
+            - (7 * sum(SpecialTD)) + (3 * sum(MadeFG)) - (2 * sum(safety))
+            - (2.625792 * sum(NoScoreTurnover)) - (0.4558461 * sum(NoScorePunt)),
+            TimeAtStart = (ifelse(max(half_seconds_remaining) > 0, max(half_seconds_remaining), 1)),
+            TOAtStart = max(posteam_timeouts_remaining),
+            TimeoutsUsed = ( max(posteam_timeouts_remaining) - min(posteam_timeouts_remaining) ),
+            FirstPlayOfDrive = sum(FirstPlayOfDrive),
+            FinalPlayOfHalf = sum(LastPlayOfHalf),
+            Turnovers = sum(Turnover),
+            NoScoreTurnovers = sum(NoScoreTurnover),
+            Punts = sum(Punt),
+            PassAttempts = sum(PassAtt),
+            NoScorePunts = sum(NoScorePunt),
+            TotalKneeldowns = sum(Kneeldown),
+            EPA = sum(epa, na.rm = TRUE), 
+            WPA = sum(wpa, na.rm = TRUE),
+            GRAPHTimeouts = case_when(max(posteam_timeouts_remaining) == 0 ~ "Timeouts = 0",
+                                      max(posteam_timeouts_remaining) == 1 ~ "Timeouts = 1",
+                                      max(posteam_timeouts_remaining) == 2 ~ "Timeouts = 2",
+                                      max(posteam_timeouts_remaining) == 3 ~ "Timeouts = 3"))
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>% filter(FirstPlayOfDrive > 0)
+
+Half_End_Info_Table <- pbp_all_ProjectPlays_LateFirstHalf %>%
+  group_by(game_id, game_half) %>%
+  filter(play_id == max(play_id)) %>%
+  ungroup() %>%
+  select(game_id, EndHalfPosTeam = posteam, EndHalfPosHomeAway = posteam_type,
+         EndHalfPosScoreDiff = score_differential_post)
+
+StartOfDrive <- pbp_all_ProjectPlays_LateFirstHalf %>%
+  group_by(game_id, drive) %>%
+  filter(play_id == min(play_id)) %>%
+  ungroup() %>%
+  select(game_id, drive, FirstPlayID = play_id, FirstPlayKnee = qb_kneel,
+         InitialEP = ep, InitialWP = wp, FieldPos = yardline_100,
+         StartDrivePosTeam = posteam, StartDrivePosHomeAway = posteam_type,
+         StartDrivePosScoreDiff = score_differential_post)
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  merge(StartOfDrive, by = c("game_id", "drive"))
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  merge(Half_End_Info_Table, by = c("game_id"))
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  mutate(HasBallEndOfHalf = ifelse(StartDrivePosHomeAway == EndHalfPosHomeAway, TRUE, FALSE))
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  mutate(RestOfHalfScoreDiff = 
+           ifelse(HasBallEndOfHalf == TRUE, 
+                  (EndHalfPosScoreDiff - StartDrivePosScoreDiff),
+                  (( -1 * EndHalfPosScoreDiff ) - StartDrivePosScoreDiff)))
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  mutate(TimeBin = ifelse(TimeAtStart <= 20, "0:01 to 0:20", 
+                          ifelse(TimeAtStart %in% 21:40, "0:21 to 0:40", 
+                                 ifelse(TimeAtStart %in% 41:60, "0:41 to 1:00", "Over 1:00"))))
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  mutate(QUIT = ifelse( PassAttempts == 0 & NetPoints < 6 & TimeoutsUsed == 0, 1, 0))
+
+NoKNEELSPointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  filter(TotalKneeldowns == 0)
+NoKNEELSPointsScoredOnDriveTable <- NoKNEELSPointsScoredOnDriveTable %>% 
+  select(-"FirstPlayKnee")
+
+NoQUITPointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  filter(QUIT == 0)
+NoQUITPointsScoredOnDriveTable <- NoQUITPointsScoredOnDriveTable %>% 
+  select(-"FirstPlayKnee")
+
+ADJUSTEDNetLMV1 <- lm(ADJUSTEDNetPoints ~ TimeAtStart + FieldPos + TOAtStart, NoKNEELSPointsScoredOnDriveTable) 
+ADJUSTEDNetLMV1$coefficients
+summary(ADJUSTEDNetLMV1)$coefficients
+
+NoKNEELS_ADJUSTEDNetV1Prediction <- predict(ADJUSTEDNetLMV1, 
+                                           newdata = NoKNEELSPointsScoredOnDriveTable)
+NoKNEELS_ADJUSTEDNetV1Error <- NoKNEELSPointsScoredOnDriveTable$ADJUSTEDNetPoints - NoKNEELS_ADJUSTEDNetV1Prediction
+
+ADJUSTEDNetV1Prediction <- predict(ADJUSTEDNetLMV1, newdata = PointsScoredOnDriveTable)
+ADJUSTEDNetV1Error <- PointsScoredOnDriveTable$ADJUSTEDNetPoints - ADJUSTEDNetV1Prediction
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  mutate(ExpADJUSTEDNetV1 = ADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = ADJUSTEDNetV1Error)
+
+NoKNEELSPointsScoredOnDriveTable <- NoKNEELSPointsScoredOnDriveTable %>%
+  mutate(ExpADJUSTEDNetV1 = NoKNEELS_ADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = NoKNEELS_ADJUSTEDNetV1Error)
+
+ADJUSTEDNetLMV3 <- lm(ADJUSTEDNetPoints ~ TimeAtStart + FieldPos + TOAtStart, NoQUITPointsScoredOnDriveTable) 
+ADJUSTEDNetLMV3$coefficients
+summary(ADJUSTEDNetLMV3)$coefficients
+
+NoQuit_ADJUSTEDNetV3Prediction <- predict(ADJUSTEDNetLMV3, 
+                                          newdata = NoQUITPointsScoredOnDriveTable)
+
+NoQuit_ADJUSTEDNetV3Error <- 
+  NoQUITPointsScoredOnDriveTable$ADJUSTEDNetPoints - NoQuit_ADJUSTEDNetV3Prediction
+
+ADJUSTEDNetV3Prediction <- predict(ADJUSTEDNetLMV3, newdata = PointsScoredOnDriveTable)
+ADJUSTEDNetV3Error <- PointsScoredOnDriveTable$ADJUSTEDNetPoints - ADJUSTEDNetV3Prediction
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  mutate(ExpADJUSTEDNetV3 = ADJUSTEDNetV3Prediction, 
+         ADJUSTEDNetErrorV3 = ADJUSTEDNetV3Error)
+
+NoQUITPointsScoredOnDriveTable <- NoQUITPointsScoredOnDriveTable %>%
+  mutate(ExpADJUSTEDNetV3 = NoQuit_ADJUSTEDNetV3Prediction, 
+         ADJUSTEDNetErrorV3 = NoQuit_ADJUSTEDNetV3Error)
+
+NetPointDiff_LMV1 <- lm(RestOfHalfScoreDiff ~ TimeAtStart + FieldPos + TOAtStart, NoKNEELSPointsScoredOnDriveTable) 
+NetPointDiff_LMV1$coefficients
+summary(NetPointDiff_LMV1)$coefficients
+
+NoKNEELS_NetPointDiff_V1Prediction <- predict(NetPointDiff_LMV1,
+                                              newdata = NoKNEELSPointsScoredOnDriveTable)
+NoKNEELS_NetPointDiff_V1Error <- 
+  NoKNEELSPointsScoredOnDriveTable$RestOfHalfScoreDiff - NoKNEELS_NetPointDiff_V1Prediction
+
+NetPointDiff_V1Prediction <- predict(NetPointDiff_LMV1, newdata = PointsScoredOnDriveTable)
+NetPointDiff_V1Error <- 
+  PointsScoredOnDriveTable$RestOfHalfScoreDiff - NetPointDiff_V1Prediction
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  mutate(ExpNetPointDiffV1 = NetPointDiff_V1Prediction, 
+         NetPointDiffErrorV1 = NetPointDiff_V1Error)
+
+NoKNEELSPointsScoredOnDriveTable <- NoKNEELSPointsScoredOnDriveTable %>%
+  mutate(ExpNetPointDiffV1 = NoKNEELS_NetPointDiff_V1Prediction, 
+         NetPointDiffErrorV1 = NoKNEELS_NetPointDiff_V1Error)
+
+NetPointDiff_LMV3 <- lm(RestOfHalfScoreDiff ~ TimeAtStart + FieldPos + TOAtStart, NoQUITPointsScoredOnDriveTable) 
+NetPointDiff_LMV3$coefficients
+summary(NetPointDiff_LMV3)$coefficients
+
+NoQUIT_NetPointDiff_V3Prediction <- predict(NetPointDiff_LMV3,
+                                            newdata = NoQUITPointsScoredOnDriveTable)
+NoQUIT_NetPointDiff_V3Error <- 
+  NoQUITPointsScoredOnDriveTable$RestOfHalfScoreDiff - NoQUIT_NetPointDiff_V3Prediction
+
+NetPointDiff_V3Prediction <- predict(NetPointDiff_LMV3, newdata = PointsScoredOnDriveTable)
+NetPointDiff_V3Error <- 
+  PointsScoredOnDriveTable$RestOfHalfScoreDiff - NetPointDiff_V3Prediction
+
+PointsScoredOnDriveTable <- PointsScoredOnDriveTable %>%
+  mutate(ExpNetPointDiffV3 = NetPointDiff_V3Prediction, 
+         NetPointDiffErrorV3 = NetPointDiff_V3Error)
+
+NoQUITPointsScoredOnDriveTable <- NoQUITPointsScoredOnDriveTable %>%
+  mutate(ExpNetPointDiffV3 = NoQUIT_NetPointDiff_V3Prediction, 
+         NetPointDiffErrorV3 = NoQUIT_NetPointDiff_V3Error)
+
+# Mean EPA occurrence 2
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable %>%
+  filter(FieldPos >= 51)
+
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable_OwnTerritory %>%
+  mutate(PositionBin = ifelse(FieldPos >= 91, "0-9", 
+                              ifelse(FieldPos %in% 81:90, "10s", 
+                                     ifelse(FieldPos %in% 71:80, "20s",
+                                            ifelse(FieldPos %in% 61:70, "30s", "40s")))))
+
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable_OwnTerritory %>%
+  select(-"ADJUSTEDNetPoints")
+
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable_OwnTerritory %>%
+  mutate(ADJUSTEDNetPoints = NetPoints - (2.583863 * NoScoreTurnovers) 
+         - (0.6636405 * NoScorePunts) )
+
+NoKNEELSOwnTerritoryTable <- PointsScoredOnDriveTable_OwnTerritory %>% 
+  filter(TotalKneeldowns == 0)
+
+NoKNEELSOwnTerritoryTable <- NoKNEELSOwnTerritoryTable %>%
+  mutate(PositionBin = ifelse(FieldPos >= 91, "0-9", 
+                              ifelse(FieldPos %in% 81:90, "10s", 
+                                     ifelse(FieldPos %in% 71:80, "20s",
+                                            ifelse(FieldPos %in% 61:70, "30s", "40s")))))
+
+NoQUITOwnTerritoryTable <- PointsScoredOnDriveTable_OwnTerritory %>% 
+  filter(QUIT == 0)
+
+NoQUITOwnTerritoryTable <- NoQUITOwnTerritoryTable %>%
+  mutate(PositionBin = ifelse(FieldPos >= 91, "0-9", 
+                              ifelse(FieldPos %in% 81:90, "10s", 
+                                     ifelse(FieldPos %in% 71:80, "20s",
+                                            ifelse(FieldPos %in% 61:70, "30s", "40s")))))
+
+OwnTerritory_ADJUSTEDNetLMV1 <- lm(ADJUSTEDNetPoints ~ TimeAtStart + FieldPos + TOAtStart, NoKNEELSOwnTerritoryTable) 
+OwnTerritory_ADJUSTEDNetLMV1$coefficients
+summary(OwnTerritory_ADJUSTEDNetLMV1)$coefficients
+
+NoKNEELS_OwnTerritory_ADJUSTEDNetV1Prediction <- predict(OwnTerritory_ADJUSTEDNetLMV1, 
+                                                         newdata = NoKNEELSOwnTerritoryTable)
+NoKNEELS_OwnTerritory_ADJUSTEDNetV1Error <- 
+  NoKNEELSOwnTerritoryTable$ADJUSTEDNetPoints - NoKNEELS_OwnTerritory_ADJUSTEDNetV1Prediction
+
+OwnTerritory_ADJUSTEDNetV1Prediction <- predict(OwnTerritory_ADJUSTEDNetLMV1, newdata = PointsScoredOnDriveTable_OwnTerritory)
+OwnTerritory_ADJUSTEDNetV1Error <- PointsScoredOnDriveTable_OwnTerritory$ADJUSTEDNetPoints - OwnTerritory_ADJUSTEDNetV1Prediction
+
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable_OwnTerritory %>%
+  mutate(ExpADJUSTEDNetV1 = OwnTerritory_ADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = OwnTerritory_ADJUSTEDNetV1Error)
+
+NoKNEELSOwnTerritoryTable <- NoKNEELSOwnTerritoryTable %>%
+  mutate(ExpADJUSTEDNetV1 = NoKNEELS_OwnTerritory_ADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = NoKNEELS_OwnTerritory_ADJUSTEDNetV1Error)
+
+OwnTerritory_ADJUSTEDNetLMV3 <- lm(ADJUSTEDNetPoints ~ TimeAtStart + FieldPos + TOAtStart, NoQUITOwnTerritoryTable) 
+OwnTerritory_ADJUSTEDNetLMV3$coefficients
+summary(OwnTerritory_ADJUSTEDNetLMV3)$coefficients
+
+NoQUIT_OwnTerritory_ADJUSTEDNetV3Prediction <- predict(OwnTerritory_ADJUSTEDNetLMV3, 
+                                                       newdata = NoQUITOwnTerritoryTable)
+NoQUIT_OwnTerritory_ADJUSTEDNetV3Error <- 
+  NoQUITOwnTerritoryTable$ADJUSTEDNetPoints - NoQUIT_OwnTerritory_ADJUSTEDNetV3Prediction
+
+OwnTerritory_ADJUSTEDNetV3Prediction <- predict(OwnTerritory_ADJUSTEDNetLMV3, newdata = PointsScoredOnDriveTable_OwnTerritory)
+OwnTerritory_ADJUSTEDNetV3Error <- PointsScoredOnDriveTable_OwnTerritory$ADJUSTEDNetPoints - OwnTerritory_ADJUSTEDNetV3Prediction
+
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable_OwnTerritory %>%
+  mutate(ExpADJUSTEDNetV3 = OwnTerritory_ADJUSTEDNetV3Prediction, 
+         ADJUSTEDNetErrorV3 = OwnTerritory_ADJUSTEDNetV3Error)
+
+NoQUITOwnTerritoryTable <- NoQUITOwnTerritoryTable %>%
+  mutate(ExpADJUSTEDNetV3 = NoQUIT_OwnTerritory_ADJUSTEDNetV3Prediction, 
+         ADJUSTEDNetErrorV3 = NoQUIT_OwnTerritory_ADJUSTEDNetV3Error)
+
+OwnTerritory_NetPointDiff_LMV1 <- lm(RestOfHalfScoreDiff ~ TimeAtStart + FieldPos + TOAtStart, NoKNEELSOwnTerritoryTable) 
+OwnTerritory_NetPointDiff_LMV1$coefficients
+summary(OwnTerritory_NetPointDiff_LMV1)$coefficients
+
+NoKNEELS_OwnTerritory_NetPointDiff_V1Prediction <- predict(OwnTerritory_NetPointDiff_LMV1, 
+                                                         newdata = NoKNEELSOwnTerritoryTable)
+NoKNEELS_OwnTerritory_NetPointDiff_V1Error <- 
+  NoKNEELSOwnTerritoryTable$RestOfHalfScoreDiff - NoKNEELS_OwnTerritory_NetPointDiff_V1Prediction
+
+OwnTerritory_NetPointDiff_V1Prediction <- predict(OwnTerritory_NetPointDiff_LMV1, newdata = PointsScoredOnDriveTable_OwnTerritory)
+OwnTerritory_NetPointDiff_V1Error <- 
+  PointsScoredOnDriveTable_OwnTerritory$RestOfHalfScoreDiff - OwnTerritory_NetPointDiff_V1Prediction
+
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable_OwnTerritory %>%
+  mutate(ExpNetPointDiffV1 = OwnTerritory_NetPointDiff_V1Prediction, 
+         NetPointDiffErrorV1 = OwnTerritory_NetPointDiff_V1Error)
+
+NoKNEELSOwnTerritoryTable <- NoKNEELSOwnTerritoryTable %>%
+  mutate(ExpNetPointDiffV1 = NoKNEELS_OwnTerritory_NetPointDiff_V1Prediction, 
+         NetPointDiffErrorV1 = NoKNEELS_OwnTerritory_NetPointDiff_V1Error)
+
+OwnTerritory_NetPointDiff_LMV3 <- lm(RestOfHalfScoreDiff ~ TimeAtStart + FieldPos + TOAtStart, NoQUITOwnTerritoryTable) 
+OwnTerritory_NetPointDiff_LMV3$coefficients
+summary(OwnTerritory_NetPointDiff_LMV3)$coefficients
+
+NoQUIT_OwnTerritory_NetPointDiff_V3Prediction <- predict(OwnTerritory_NetPointDiff_LMV3, 
+                                                       newdata = NoQUITOwnTerritoryTable)
+NoQUIT_OwnTerritory_NetPointDiff_V3Error <- 
+  NoQUITOwnTerritoryTable$RestOfHalfScoreDiff - NoQUIT_OwnTerritory_NetPointDiff_V3Prediction
+
+OwnTerritory_NetPointDiff_V3Prediction <- predict(OwnTerritory_NetPointDiff_LMV3, newdata = PointsScoredOnDriveTable_OwnTerritory)
+OwnTerritory_NetPointDiff_V3Error <- 
+  PointsScoredOnDriveTable_OwnTerritory$RestOfHalfScoreDiff - OwnTerritory_NetPointDiff_V3Prediction
+
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable_OwnTerritory %>%
+  mutate(ExpNetPointDiffV3 = OwnTerritory_NetPointDiff_V3Prediction, 
+         NetPointDiffErrorV3 = OwnTerritory_NetPointDiff_V3Error)
+
+NoQUITOwnTerritoryTable <- NoQUITOwnTerritoryTable %>%
+  mutate(ExpNetPointDiffV3 = NoQUIT_OwnTerritory_NetPointDiff_V3Prediction, 
+         NetPointDiffErrorV3 = NoQUIT_OwnTerritory_NetPointDiff_V3Error)
+
+ggplot(data = NoKNEELSOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on Drives w/ NO KNEELS; Start in Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 3014)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on 'No-Quit' Drives; Start in Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 2700)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# No facet-wrap test
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.64) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on 'No-Quit' Drives; Start in Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 2700)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = NoKNEELSOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on Drives w/ NO KNEELS; Start in Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 3014)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.6),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on 'No-Quit' Drives; Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 2700)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# No facet-wrap test
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.64) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on 'No-Quit' Drives; Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 2700)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Also, look at the kneeldown drives separately (how much EP/WP was lost)
+FirstPlayKNEELS_DriveTable <- PointsScoredOnDriveTable %>%
+  filter(FirstPlayKnee > 0 & NetPoints <= 0)
+
+FirstPlayKNEELS_DriveTable <- FirstPlayKNEELS_DriveTable %>% 
+  select(-"FirstPlayKnee")
+
+KneelsAfterFirstPlayDRIVETable <- PointsScoredOnDriveTable %>%
+  filter(FirstPlayKnee == 0 & TotalKneeldowns > 0 & NetPoints <= 0)
+KneelsAfterFirstPlayDRIVETable <- KneelsAfterFirstPlayDRIVETable %>%
+  select(-"FirstPlayKnee")
+
+FirstPlayBeforeKneeVector <- KneelsAfterFirstPlayDRIVETable$FirstPlayID
+GAMESWithPlayBeforeKneeVector <- KneelsAfterFirstPlayDRIVETable$game_id
+
+FirstPlaysBeforeKnee <- pbp_all_ProjectPlays %>% 
+  filter(play_id %in% FirstPlayBeforeKneeVector)
+
+KneelsAfterFirstPlay <- pbp_all_ProjectPlays_LateFirstHalf %>% 
+  filter(game_id %in% GAMESWithPlayBeforeKneeVector & Kneeldown == 1 & FirstPlayOfDrive == 0)
+
+KneelsAfterFirstPlay <- KneelsAfterFirstPlay %>%
+  group_by(game_id, drive) %>%
+  filter(play_id == min(play_id)) %>%
+  ungroup()
+
+ALLLateKneels <- pbp_all_ProjectPlays_LateFirstHalf %>%
+  filter(play_type == "qb_kneel" & qb_kneel == 1)
+
+ALLLateKneels_OwnTerritory <- ALLLateKneels %>%
+  filter(yardline_100 >= 51)
+
+ALLLateKneels_OwnTerritory <- ALLLateKneels_OwnTerritory %>%
+  mutate(PositionBin = ifelse(yardline_100 >= 91, "0-9", 
+                              ifelse(yardline_100 %in% 81:90, "10s", 
+                                     ifelse(yardline_100 %in% 71:80, "20s",
+                                            ifelse(yardline_100 %in% 61:70, "30s", "40s")))))
+
+ALLLateKneelsTable <- ALLLateKneels %>% 
+  group_by(game_id, drive) %>%
+  summarize(FirstPlayID = min(play_id),
+            NetPoints = (7 * sum(OffensiveTD)) - (7 * sum(DefensiveTD)) 
+            - (7 * sum(SpecialTD)) + (3 * sum(MadeFG)) - (2 * sum(safety)), 
+            ADJUSTEDNetPoints = (7 * sum(OffensiveTD)) - (7 * sum(DefensiveTD)) 
+            - (7 * sum(SpecialTD)) + (3 * sum(MadeFG)) - (2 * sum(safety))
+            - (2.625792 * sum(NoScoreTurnover)) - (0.4558461 * sum(NoScorePunt)),
+            TimeAtStart = (ifelse(max(half_seconds_remaining) > 0, max(half_seconds_remaining), 1)),
+            TOAtStart = max(posteam_timeouts_remaining),
+            FirstPlayOfDrive = sum(FirstPlayOfDrive),
+            Turnovers = sum(Turnover),
+            TotalKneeldowns = sum(Kneeldown),
+            EPA = sum(epa, na.rm = TRUE), 
+            WPA = sum(wpa, na.rm = TRUE),
+            GRAPHTimeouts = case_when(max(posteam_timeouts_remaining) == 0 ~ "Timeouts = 0",
+                                      max(posteam_timeouts_remaining) == 1 ~ "Timeouts = 1",
+                                      max(posteam_timeouts_remaining) == 2 ~ "Timeouts = 2",
+                                      max(posteam_timeouts_remaining) == 3 ~ "Timeouts = 3"))
+
+ALLLateKneelsTable <- ALLLateKneelsTable %>% filter(game_id != 2015121313)
+
+StartOfKNEELDrive <- ALLLateKneels %>%
+  group_by(game_id, drive) %>%
+  filter(play_id == min(play_id)) %>%
+  ungroup() %>%
+  select(game_id, drive,
+         InitialEP = ep, InitialWP = wp, FieldPos = yardline_100)
+
+ALLLateKneelsTable <- ALLLateKneelsTable %>%
+  merge(StartOfKNEELDrive, by = c("game_id", "drive"))
+
+ALLLateKneelsTable <- ALLLateKneelsTable %>%
+  mutate(TimeBin = ifelse(TimeAtStart <= 20, "0:01 to 0:20", 
+                          ifelse(TimeAtStart %in% 21:40, "0:21 to 0:40", 
+                                 ifelse(TimeAtStart %in% 41:60, "0:41 to 1:00", "Over 1:00"))))
+
+ALLLateKneelsTable <- ALLLateKneelsTable %>%
+  mutate(PositionBin = ifelse(FieldPos >= 91, "0-9", 
+                              ifelse(FieldPos %in% 81:90, "10s", 
+                                     ifelse(FieldPos %in% 71:80, "20s",
+                                            ifelse(FieldPos %in% 61:70, "30s", "40s and Up")))))
+
+AllQuitDriveTable <- PointsScoredOnDriveTable %>%
+  filter(QUIT > 0)
+
+ALLKNEELSADJUSTEDNetV1Prediction <- predict(ADJUSTEDNetLMV1, 
+                                            newdata = ALLLateKneelsTable)
+ALLKNEELSADJUSTEDNetV1Error <- ALLLateKneelsTable$ADJUSTEDNetPoints - ALLKNEELSADJUSTEDNetV1Prediction
+
+ALLLateKneelsTable <- ALLLateKneelsTable %>%
+  mutate(ExpADJUSTEDNetV1 = ALLKNEELSADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = ALLKNEELSADJUSTEDNetV1Error)
+
+ALLKNEELS_NetPointDiff_V1Prediction <- predict(NetPointDiff_LMV1, 
+                                               newdata = ALLLateKneelsTable)
+ALLKNEELS_NetPointDiff_V1Error <- 0 - ALLKNEELS_NetPointDiff_V1Prediction
+
+ALLLateKneelsTable <- ALLLateKneelsTable %>%
+  mutate(ExpNetPointDiffV1 = ALLKNEELS_NetPointDiff_V1Prediction, 
+         NetPointDiffErrorV1 = ALLKNEELS_NetPointDiff_V1Error)
+
+ALLLateKneels_OwnTerritory_Table <- ALLLateKneelsTable %>%
+  filter(FieldPos >= 51)
+
+ALLLateKneels_OwnTerritory_Table <- ALLLateKneels_OwnTerritory_Table %>%
+  mutate(PositionBin = ifelse(FieldPos >= 91, "0-9", 
+                              ifelse(FieldPos %in% 81:90, "10s", 
+                                     ifelse(FieldPos %in% 71:80, "20s",
+                                            ifelse(FieldPos %in% 61:70, "30s", "40s")))))
+
+ALLKNEELS_OwnTerritory_ADJUSTEDNetV1Prediction <- predict(OwnTerritory_ADJUSTEDNetLMV1, 
+                                                          newdata = ALLLateKneels_OwnTerritory_Table)
+ALLKNEELS_OwnTerritory_ADJUSTEDNetV1Error <- ALLLateKneels_OwnTerritory_Table$ADJUSTEDNetPoints - ALLKNEELS_OwnTerritory_ADJUSTEDNetV1Prediction
+
+ALLLateKneels_OwnTerritory_Table <- ALLLateKneels_OwnTerritory_Table %>%
+  mutate(ExpADJUSTEDNetV1 = ALLKNEELS_OwnTerritory_ADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = ALLKNEELS_OwnTerritory_ADJUSTEDNetV1Error)
+
+ALLQuit_OwnTerritory_Table <- AllQuitDriveTable %>%
+  filter(FieldPos >= 51)
+
+ALLQuit_OwnTerritory_ADJUSTEDNetV3Prediction <- predict(OwnTerritory_ADJUSTEDNetLMV3, 
+                                                        newdata = ALLQuit_OwnTerritory_Table)
+ALLQuit_OwnTerritory_ADJUSTEDNetV3Error <- ALLQuit_OwnTerritory_Table$ADJUSTEDNetPoints - ALLQuit_OwnTerritory_ADJUSTEDNetV3Prediction
+
+ALLQuit_OwnTerritory_Table <- ALLQuit_OwnTerritory_Table %>%
+  mutate(ExpADJUSTEDNetV3 = ALLQuit_OwnTerritory_ADJUSTEDNetV3Prediction, 
+         ADJUSTEDNetErrorV3 = ALLQuit_OwnTerritory_ADJUSTEDNetV3Error)
+
+# Look at final plays themselves
+FinalPlayOfHalf <- pbp_all_ProjectPlays_LateFirstHalf %>%
+  filter(LastPlayOfHalf == 1)
+
+FinalPlayOfHalf <- FinalPlayOfHalf %>%
+  mutate(QUIT = ifelse( (qb_kneel == 1 & Kneeldown == 1) | rush_attempt == 1, 1, 0 ))
+
+FinalPlayOfHalf_NoKneelsOrFGs <- FinalPlayOfHalf %>%
+  filter(qb_kneel == 0 & Kneeldown == 0 & field_goal_attempt == 0)
+
+FinalPlayOfHalf_PASSES <- FinalPlayOfHalf %>%
+  filter(qb_kneel == 0 & Kneeldown == 0 & field_goal_attempt == 0 & pass_attempt == 1)
+
+FinalPlayOfHalf_RUNS <- FinalPlayOfHalf %>%
+  filter(qb_kneel == 0 & Kneeldown == 0 & field_goal_attempt == 0 & rush_attempt == 1)
+
+FinalPlayOfHalf_Table <- FinalPlayOfHalf %>% 
+  group_by(game_id, drive) %>%
+  summarize(NetPoints = (7 * sum(OffensiveTD)) - (7 * sum(DefensiveTD)) 
+            + (3 * sum(MadeFG)) - (2 * sum(safety)),
+            TimeAtStart = (ifelse( half_seconds_remaining > 0, half_seconds_remaining, 1)),
+            FieldPos = yardline_100,
+            Turnovers = sum(Turnover),
+            Kneeldown = sum(Kneeldown),
+            QUIT = sum(QUIT),
+            EPA = sum(epa, na.rm = TRUE), 
+            WPA = sum(wpa, na.rm = TRUE),
+            InitialEP = ep, InitialWP = wp)
+
+FinalPlayOfHalf_OwnTerritory_Table <- FinalPlayOfHalf_Table %>%
+  filter(FieldPos >= 51)
+
+FinalPlayOfHalf_NoKneelsOrFGs_Table <- FinalPlayOfHalf_NoKneelsOrFGs %>% 
+  group_by(game_id, drive) %>%
+  summarize(NetPoints = (7 * sum(OffensiveTD)) - (7 * sum(DefensiveTD)) 
+            - (2 * sum(safety)),
+            TimeAtStart = (ifelse( half_seconds_remaining > 0, half_seconds_remaining, 1)),
+            FieldPos = yardline_100,
+            Turnovers = sum(Turnover),
+            QUIT = sum(QUIT),
+            EPA = sum(epa, na.rm = TRUE), 
+            WPA = sum(wpa, na.rm = TRUE),
+            InitialEP = ep, InitialWP = wp)
+
+FinalPlayOfHalf_PASSES_Table <- FinalPlayOfHalf_PASSES %>% 
+  group_by(game_id, drive) %>%
+  summarize(NetPoints = (7 * sum(OffensiveTD)) - (7 * sum(DefensiveTD)) 
+            - (2 * sum(safety)),
+            TimeAtStart = (ifelse( half_seconds_remaining > 0, half_seconds_remaining, 1)),
+            FieldPos = yardline_100,
+            Turnovers = sum(Turnover),
+            EPA = sum(epa, na.rm = TRUE), 
+            WPA = sum(wpa, na.rm = TRUE),
+            InitialEP = ep, InitialWP = wp)
+
+FinalPlayOfHalf_RUNS_Table <- FinalPlayOfHalf_RUNS %>% 
+  group_by(game_id, drive) %>%
+  summarize(NetPoints = (7 * sum(OffensiveTD)) - (7 * sum(DefensiveTD)) 
+            - (2 * sum(safety)),
+            TimeAtStart = (ifelse( half_seconds_remaining > 0, half_seconds_remaining, 1)),
+            FieldPos = yardline_100,
+            Turnovers = sum(Turnover),
+            EPA = sum(epa, na.rm = TRUE), 
+            WPA = sum(wpa, na.rm = TRUE),
+            InitialEP = ep, InitialWP = wp)
+
+FinalPlayOfHalf_Pass_NetPoints_LMV3 <- lm(NetPoints ~ FieldPos, FinalPlayOfHalf_PASSES_Table) 
+FinalPlayOfHalf_Pass_NetPoints_LMV3$coefficients
+summary(FinalPlayOfHalf_Pass_NetPoints_LMV3)$coefficients
+
+FinalPlayOfHalf_Pass_NetPoints_V3Prediction <- predict(FinalPlayOfHalf_Pass_NetPoints_LMV3, 
+                                                       newdata = FinalPlayOfHalf_PASSES_Table)
+FinalPlayOfHalf_Pass_NetPoints_V3Error <- 
+  FinalPlayOfHalf_PASSES_Table$NetPoints - FinalPlayOfHalf_Pass_NetPoints_V3Prediction
+
+FinalPlayOfHalf_PASSES_Table <- cbind(FinalPlayOfHalf_PASSES_Table, ExpNetPointsV3 = FinalPlayOfHalf_Pass_NetPoints_V3Prediction)
+
+FinalPlayOfHalf_PASSES_Table <- cbind(FinalPlayOfHalf_PASSES_Table, NetPointsErrorV3 = FinalPlayOfHalf_Pass_NetPoints_V3Error)
+
+FinalPlayOfHalf_NetPoints_V3Prediction <- 
+  predict(FinalPlayOfHalf_Pass_NetPoints_LMV3, newdata = FinalPlayOfHalf_Table)
+FinalPlayOfHalf_NetPoints_V3Error <- FinalPlayOfHalf_Table$NetPoints - FinalPlayOfHalf_NetPoints_V3Prediction
+
+FinalPlayOfHalf_Table <- cbind(FinalPlayOfHalf_Table, ExpNetPointsV3 = FinalPlayOfHalf_NetPoints_V3Prediction)
+ 
+FinalPlayOfHalf_Table <- cbind(FinalPlayOfHalf_Table, NetPointsErrorV3 = FinalPlayOfHalf_NetPoints_V3Error)
+     
+FinalPlayOfHalf_PASSES_OwnTerritory_Table <- FinalPlayOfHalf_PASSES_Table %>%
+  filter(FieldPos >= 51)
+
+FinalPlayOfHalf_RUNS_OwnTerritory_Table <- FinalPlayOfHalf_RUNS_Table %>%
+  filter(FieldPos >= 51)
+
+ggplot(data = FinalPlayOfHalf_NoKneelsOrFGs_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints),
+              method = "loess", se = F, span = 0.35) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on Final Play of 1st Half (No Kneels or FGs)",
+       subtitle = "2009-2019 (n = 1170)",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+FinalPlayOfHalf_NoKneelsOrFGs_OwnTerritory <- FinalPlayOfHalf_NoKneelsOrFGs_Table %>%
+  filter(FieldPos >= 51)
+
+ggplot(data = FinalPlayOfHalf_NoKneelsOrFGs_OwnTerritory) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints),
+              method = "loess", se = F, span = 0.75) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on Final Play of 1st Half (No Kneels or FGs)",
+       subtitle = "Own Territory, 2009-2019 (n = 900)",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalPlayOfHalf_PASSES_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints),
+              method = "loess", se = F, span = 0.28) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on Final Play of 1st Half",
+       subtitle = "PASS ATTEMPTS ONLY, 2009-2019 (n = 588)",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalPlayOfHalf_PASSES_OwnTerritory_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints),
+              method = "loess", se = F, span = 0.75) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on Final Play of 1st Half",
+       subtitle = "Pass Attempts in Own Territory, 2009-2019 (n = 363)",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalPlayOfHalf_RUNS_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints),
+              method = "loess", se = F, span = 0.35) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on Final Play of 1st Half",
+       subtitle = "RUSH ATTEMPTS ONLY, 2009-2019 (n = 522)",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# GOOD geom-point and best-fit curve here
+ggplot(data = FinalPlayOfHalf_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = Kneeldown),
+              method = "loess", se = F, span = 0.35) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  geom_point(mapping = aes(x = FieldPos, y = Kneeldown)) +
+  labs(x = "Starting Field Pos", y = "Kneeldown Rate",
+       title = "Kneeldown Rate on Final Play of 1st Half",
+       subtitle = "2009-2019 (n = 2815)",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalPlayOfHalf_OwnTerritory_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = QUIT),
+              method = "loess", se = F, span = 0.35) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "Quit Rate",
+       title = "Quit Rate on Final Play of 1st Half",
+       subtitle = "Own Territory, 2009-2019 (n = 1775)",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Isolate final minute, own territory, mean EPA occurrence 3
+pbp_all_ProjectPlays_FinalMin_OwnTerritory <-
+  pbp_all_ProjectPlays_LateFirstHalf_OwnTerritory %>%
+  filter(half_seconds_remaining <= 60)
+
+FinalMin_OwnTerritory_Table <- PointsScoredOnDriveTable_OwnTerritory %>%
+  filter(TimeAtStart <= 60)
+
+FinalMin_OwnTerritory_Table <- FinalMin_OwnTerritory_Table %>%
+  select(-"ADJUSTEDNetPoints")
+
+FinalMin_OwnTerritory_Table <- FinalMin_OwnTerritory_Table %>%
+  mutate( ADJUSTEDNetPoints = NetPoints - (2.334668 * NoScoreTurnovers) 
+          - (0.4098231 * NoScorePunts) )
+
+FinalMin_OwnTerritory_NoKNEELSTable <- FinalMin_OwnTerritory_Table %>%
+  filter(TotalKneeldowns == 0)
+FinalMin_OwnTerritory_NoKNEELSTable <- FinalMin_OwnTerritory_NoKNEELSTable %>% 
+  select(-"FirstPlayKnee")
+
+FinalMin_OwnTerritory_NoQUIT_Table <- FinalMin_OwnTerritory_Table %>%
+  filter(QUIT == 0)
+FinalMin_OwnTerritory_NoQUIT_Table <- FinalMin_OwnTerritory_NoQUIT_Table %>% 
+  select(-"FirstPlayKnee")
+
+FinalMin_OwnTerritory_ADJUSTEDNetLMV1 <- 
+  lm(ADJUSTEDNetPoints ~ TimeAtStart + FieldPos + TOAtStart, FinalMin_OwnTerritory_NoKNEELSTable) 
+FinalMin_OwnTerritory_ADJUSTEDNetLMV1$coefficients
+summary(FinalMin_OwnTerritory_ADJUSTEDNetLMV1)$coefficients
+
+NoKNEELS_FinalMin_ADJUSTEDNetV1Prediction <- predict(FinalMin_OwnTerritory_ADJUSTEDNetLMV1, 
+                                                     newdata = FinalMin_OwnTerritory_NoKNEELSTable)
+NoKNEELS_FinalMin_ADJUSTEDNetV1Error <- 
+  FinalMin_OwnTerritory_NoKNEELSTable$ADJUSTEDNetPoints - NoKNEELS_FinalMin_ADJUSTEDNetV1Prediction
+
+FinalMin_ADJUSTEDNetV1Prediction <- predict(FinalMin_OwnTerritory_ADJUSTEDNetLMV1, newdata = FinalMin_OwnTerritory_Table)
+FinalMin_ADJUSTEDNetV1Error <- FinalMin_OwnTerritory_Table$ADJUSTEDNetPoints - FinalMin_ADJUSTEDNetV1Prediction
+
+FinalMin_OwnTerritory_Table <- FinalMin_OwnTerritory_Table %>%
+  mutate(ExpADJUSTEDNetV1 = FinalMin_ADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = FinalMin_ADJUSTEDNetV1Error)
+
+FinalMin_OwnTerritory_NoKNEELSTable <- FinalMin_OwnTerritory_NoKNEELSTable %>%
+  mutate(ExpADJUSTEDNetV1 = NoKNEELS_FinalMin_ADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = NoKNEELS_FinalMin_ADJUSTEDNetV1Error)
+
+FinalMin_OwnTerritory_ADJUSTEDNetLMV3 <- 
+  lm(ADJUSTEDNetPoints ~ TimeAtStart + FieldPos + TOAtStart, FinalMin_OwnTerritory_NoQUIT_Table) 
+FinalMin_OwnTerritory_ADJUSTEDNetLMV3$coefficients
+summary(FinalMin_OwnTerritory_ADJUSTEDNetLMV3)$coefficients
+
+NoQUIT_FinalMin_ADJUSTEDNetV3Prediction <- predict(FinalMin_OwnTerritory_ADJUSTEDNetLMV3, 
+                                                   newdata = FinalMin_OwnTerritory_NoQUIT_Table)
+NoQUIT_FinalMin_ADJUSTEDNetV3Error <- 
+  FinalMin_OwnTerritory_NoQUIT_Table$ADJUSTEDNetPoints - NoQUIT_FinalMin_ADJUSTEDNetV3Prediction
+
+FinalMin_ADJUSTEDNetV3Prediction <- predict(FinalMin_OwnTerritory_ADJUSTEDNetLMV3, newdata = FinalMin_OwnTerritory_Table)
+FinalMin_ADJUSTEDNetV3Error <- FinalMin_OwnTerritory_Table$ADJUSTEDNetPoints - FinalMin_ADJUSTEDNetV3Prediction
+
+FinalMin_OwnTerritory_Table <- FinalMin_OwnTerritory_Table %>%
+  mutate(ExpADJUSTEDNetV3 = FinalMin_ADJUSTEDNetV3Prediction, 
+         ADJUSTEDNetErrorV3 = FinalMin_ADJUSTEDNetV3Error)
+
+FinalMin_OwnTerritory_NoQUIT_Table <- FinalMin_OwnTerritory_NoQUIT_Table %>%
+  mutate(ExpADJUSTEDNetV3 = NoQUIT_FinalMin_ADJUSTEDNetV3Prediction, 
+         ADJUSTEDNetErrorV3 = NoQUIT_FinalMin_ADJUSTEDNetV3Error)
+
+ALLLateKneels_FinalMin_OwnTerritory_Table <- ALLLateKneels_OwnTerritory_Table %>%
+  filter(TimeAtStart <= 60)
+
+ALLKNEELS_FinalMin_ADJUSTEDNetV1Prediction <- predict(FinalMin_OwnTerritory_ADJUSTEDNetLMV1, 
+                                                      newdata = ALLLateKneels_FinalMin_OwnTerritory_Table)
+ALLKNEELS_FinalMin_ADJUSTEDNetV1Error <- 
+  ALLLateKneels_FinalMin_OwnTerritory_Table$ADJUSTEDNetPoints - ALLKNEELS_FinalMin_ADJUSTEDNetV1Prediction
+
+ALLLateKneels_FinalMin_OwnTerritory_Table <- ALLLateKneels_FinalMin_OwnTerritory_Table %>%
+  mutate(ExpADJUSTEDNetV1 = ALLKNEELS_FinalMin_ADJUSTEDNetV1Prediction, 
+         ADJUSTEDNetErrorV1 = ALLKNEELS_FinalMin_ADJUSTEDNetV1Error)
+
+ALLQuit_FinalMin_OwnTerritory_Table <- ALLQuit_OwnTerritory_Table %>%
+  filter(TimeAtStart <= 60)
+
+ALLQuit_FinalMin_ADJUSTEDNetV3Prediction <- predict(FinalMin_OwnTerritory_ADJUSTEDNetLMV3, 
+                                                    newdata = ALLQuit_FinalMin_OwnTerritory_Table)
+ALLQuit_FinalMin_ADJUSTEDNetV3Error <- 
+  ALLQuit_FinalMin_OwnTerritory_Table$ADJUSTEDNetPoints - ALLQuit_FinalMin_ADJUSTEDNetV3Prediction
+
+ALLQuit_FinalMin_OwnTerritory_Table <- ALLQuit_FinalMin_OwnTerritory_Table %>%
+  mutate(ExpADJUSTEDNetV3 = ALLQuit_FinalMin_ADJUSTEDNetV3Prediction, 
+         ADJUSTEDNetErrorV3 = ALLQuit_FinalMin_ADJUSTEDNetV3Error)
+
+ggplot(data = FinalMin_OwnTerritory_NoKNEELSTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = NetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Points",
+       title = "Net Points on Drives w/ NO KNEELS; Start in Own Territory",
+       subtitle = "Final Minute of 1st Half, 2009-2019 (n = 1410)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalMin_OwnTerritory_NoKNEELSTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adj Net Points on Drives w/ NO KNEELS; Start in Own Territory",
+       subtitle = "Final Minute of 1st Half, 2009-2019 (n = 1410)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalMin_OwnTerritory_NoQUIT_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adj Net Points on 'No-Quit' Drives; Start in Own Territory",
+       subtitle = "Final Minute of 1st Half, 2009-2019 (n = 1140)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# ADD TWO LINES ON ONE PLOT: non-kneels & kneels??
+ggplot(data = NoKNEELSOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "No Kneel, n = 3014"),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~TimeBin) +
+  geom_abline(intercept = 0, slope = 0) + 
+  stat_smooth(data = ALLLateKneels_OwnTerritory_Table, 
+              mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "Kneel, n = 876"),
+              method = "loess", se = F, span = 0.8) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on All Drives; Start in Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalMin_OwnTerritory_NoKNEELSTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "No Kneel, n = 1410"),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~TimeBin) +
+  geom_abline(intercept = 0, slope = 0) + 
+  stat_smooth(data = ALLLateKneels_FinalMin_OwnTerritory_Table, 
+              mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "Kneel, n = 874"),
+              method = "loess", se = F, span = 0.8) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on All Drives; Start in Own Territory",
+       subtitle = "Final Minute of 1st Half, 2009-2019",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "No Quit, n = 2700"),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~TimeBin) +
+  geom_abline(intercept = 0, slope = 0) + 
+  stat_smooth(data = ALLQuit_OwnTerritory_Table, 
+              mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "Quit, n = 1193"),
+              method = "loess", se = F, span = 0.8) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on Drives; Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# KEEP THESE ONES FOR BAD EXAMPLE
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = EPA, color = "No Quit, n = 2700"),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~TimeBin) +
+  geom_abline(intercept = 0, slope = 0) + 
+  stat_smooth(data = ALLQuit_OwnTerritory_Table, 
+              mapping = aes(x = FieldPos, y = EPA, color = "Quit, n = 1193"), 
+              method = "loess", se = F, span = 0.8) +
+  labs(x = "Starting Field Pos", y = "EPA",
+       title = "EPA on All Drives; Start in Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = WPA, color = "No Quit, n = 2700"),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~TimeBin) +
+  geom_abline(intercept = 0, slope = 0) + 
+  stat_smooth(data = ALLQuit_OwnTerritory_Table, 
+              mapping = aes(x = FieldPos, y = WPA, color = "Quit, n = 1193"), 
+              method = "loess", se = F, span = 0.8) +
+  labs(x = "Starting Field Pos", y = "WPA",
+       title = "WPA on All Drives; Start in Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalMin_OwnTerritory_NoQUIT_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "No Quit, n = 1140"),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~TimeBin) +
+  geom_abline(intercept = 0, slope = 0) + 
+  stat_smooth(data = ALLQuit_FinalMin_OwnTerritory_Table, 
+              mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "Quit, n = 1131"),
+              method = "loess", se = F, span = 0.8) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on 'No-Quit' Drives; Start in Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# PERHAPS ISOLATE 90+ YARDS TO GO SITUATIONS? Mean EPA occurrence 4
+PointsScoredOnDriveTable_90PlusYards <- PointsScoredOnDriveTable_OwnTerritory %>%
+  filter(FieldPos >= 90)
+
+PointsScoredOnDriveTable_90PlusYards <- PointsScoredOnDriveTable_90PlusYards %>%
+  select(-"ADJUSTEDNetPoints")
+
+PointsScoredOnDriveTable_90PlusYards <- PointsScoredOnDriveTable_90PlusYards %>%
+  mutate( ADJUSTEDNetPoints = NetPoints - (2.50412 * NoScoreTurnovers) 
+          - (1.115007 * NoScorePunts) )
+
+NoKNEELS_90PlusYards_Table <- PointsScoredOnDriveTable_90PlusYards %>% 
+  filter(TotalKneeldowns == 0)
+
+ALLLateKneels_90PlusYards_Table <- ALLLateKneels_OwnTerritory_Table %>%
+  filter(FieldPos >= 90)
+
+NoQUIT_90PlusYards_Table <- PointsScoredOnDriveTable_90PlusYards %>%
+  filter(QUIT == 0)
+
+AllQUIT_90PlusYards_Table <- PointsScoredOnDriveTable_90PlusYards %>%
+  filter(QUIT > 0)
+
+ggplot(data = NoKNEELS_90PlusYards_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "No Kneel, n = 258"),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~TimeBin) +
+  geom_abline(intercept = 0, slope = 0) + 
+  stat_smooth(data = ALLLateKneels_90PlusYards_Table, 
+              mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "Kneel, n = 89"),
+              method = "loess", se = F, span = 0.8) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on All Drives; Start on Own 1-10",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = NoQUIT_90PlusYards_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "No Quit, n = 185"),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~TimeBin) +
+  geom_abline(intercept = 0, slope = 0) + 
+  stat_smooth(data = AllQUIT_90PlusYards_Table, 
+              mapping = aes(x = FieldPos, y = ADJUSTEDNetPoints, color = "Quit, n = 166"),
+              method = "loess", se = F, span = 0.8) +
+  labs(x = "Starting Field Pos", y = "Adjusted Net Points",
+       title = "Adjusted Net Points on 'No-Quit' Drives; Start on Own 1-10",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019",
+       caption = "Data from nflscrapR") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Track kneeldown/quit rate (based on time/field pos)
+ggplot(data = PointsScoredOnDriveTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = FirstPlayKnee, color = TimeBin),
+              method = "loess", se = F, span = 0.64) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "1st Play Kneeldown Rate",
+       title = "1st Play Kneeldown Rate on All Drives",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 4346)",
+       caption = "Data from nflscrapR",
+       color = "Time at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = PointsScoredOnDriveTable_OwnTerritory) +
+  stat_smooth(mapping = aes(x = FieldPos, y = FirstPlayKnee, color = TimeBin),
+              method = "loess", se = F, span = 0.6) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "1st Play Kneeldown Rate",
+       title = "1st Play Kneeldown Rate on All Drives; Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 3893)",
+       caption = "Data from nflscrapR",
+       color = "Time at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalMin_OwnTerritory_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = FirstPlayKnee, color = TimeBin),
+              method = "loess", se = F, span = 0.67) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "1st Play Kneeldown Rate",
+       title = "1st Play Kneeldown Rate on All Drives; Own Territory",
+       subtitle = "Final Minute of 1st Half, 2009-2019 (n = 2271)",
+       caption = "Data from nflscrapR",
+       color = "Time at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = PointsScoredOnDriveTable_90PlusYards) +
+  stat_smooth(mapping = aes(x = FieldPos, y = FirstPlayKnee, color = TimeBin),
+              method = "loess", se = F, span = 0.67) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "1st Play Kneeldown Rate",
+       title = "1st Play Kneeldown Rate on All Drives; Start on Own 1-10",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 351)",
+       caption = "Data from nflscrapR",
+       color = "Time at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = PointsScoredOnDriveTable_OwnTerritory) +
+  stat_smooth(mapping = aes(x = FieldPos, y = QUIT, color = TimeBin),
+              method = "loess", se = F, span = 0.67) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "Quit Rate",
+       title = "Quit Rate on All Drives; Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 3893)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5)) +
+  ylim(0, 1)
+
+# NO FACET-WRAP TEST
+ggplot(data = PointsScoredOnDriveTable_OwnTerritory) +
+  stat_smooth(mapping = aes(x = FieldPos, y = QUIT, color = TimeBin),
+              method = "loess", se = F, span = 0.67) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "Quit Rate",
+       title = "Quit Rate on All Drives; Own Territory",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 3893)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = FinalMin_OwnTerritory_Table) +
+  stat_smooth(mapping = aes(x = FieldPos, y = QUIT, color = TimeBin),
+              method = "loess", se = F, span = 0.67) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "Quit Rate",
+       title = "Quit Rate on All Drives; Own Territory",
+       subtitle = "Final Minute of 1st Half, 2009-2019 (n = 2271)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+ggplot(data = PointsScoredOnDriveTable_90PlusYards) +
+  stat_smooth(mapping = aes(x = FieldPos, y = QUIT, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0.5, slope = 0, lty = 2) +
+  labs(x = "Starting Field Pos", y = "Quit Rate",
+       title = "Quit Rate on All Drives; Start on Own 1-10",
+       subtitle = "Last 2 Min of 1st Half, 2009-2019 (n = 351)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Look into MOST EGREGIOUS KNEELS
+view(arrange(FirstPlayKNEELS_DriveTable, desc(ExpADJUSTEDNetV1)))
+
+# Also MOST IMPROBABLE SCORES? Or most disastrous drives
+view(arrange(PointsScoredOnDriveTable, desc(ExpADJUSTEDNetV3)))
+view(arrange(PointsScoredOnDriveTable, ADJUSTEDNetErrorV3))
+
+# All "Net Point Differential" ggplots
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = RestOfHalfScoreDiff, color = TimeBin),
+              method = "loess", se = F, span = 0.8) + facet_wrap(~GRAPHTimeouts) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Point Differential",
+       title = "Rest of Half Point Differential on 'No-Quit' Drives",
+       subtitle = "Last 2 Min of 1st Half, Own Territory, 2009-2019 (n = 2700)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# No facet-wrap
+ggplot(data = NoQUITOwnTerritoryTable) +
+  stat_smooth(mapping = aes(x = FieldPos, y = RestOfHalfScoreDiff, color = TimeBin),
+              method = "loess", se = F, span = 0.8) +
+  geom_abline(intercept = 0, slope = 0) +
+  labs(x = "Starting Field Pos", y = "Net Point Differential",
+       title = "Rest of Half Point Differential on 'No-Quit' Drives",
+       subtitle = "Last 2 Min of 1st Half, Own Territory, 2009-2019 (n = 2700)",
+       caption = "Data from nflscrapR",
+       color = "Time Left at Start") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        plot.subtitle = element_text(size = 8, hjust = 0.5))
+
+# Test out theoretical situations
+OwnTerritory_ADJNetPoints_V1SamplePrediction <- predict(OwnTerritory_ADJUSTEDNetLMV1, 
+                                                      newdata = data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                                                           "FieldPos" = c(90, 75, 80, 70, 65), 
+                                                                           "TOAtStart" = c(0, 1, 0, 3, 0)))
+
+OwnTerritoryADJNetV1SampleDF <- cbind(data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                               "FieldPos" = c(90, 75, 80, 70, 65), 
+                                               "TOAtStart" = c(0, 1, 0, 3, 0)),
+                                    "PredictedADJNetPoints" = OwnTerritory_ADJNetPoints_V1SamplePrediction)
+view(OwnTerritoryADJNetV1SampleDF)
+
+OwnTerritory_ADJNetPoints_V3SamplePrediction <- predict(OwnTerritory_ADJUSTEDNetLMV3, 
+                                                      newdata = data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                                                           "FieldPos" = c(90, 75, 80, 70, 65), 
+                                                                           "TOAtStart" = c(0, 1, 0, 3, 0)))
+
+OwnTerritoryADJNetV3SampleDF <- cbind(data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                               "FieldPos" = c(90, 75, 80, 70, 65), 
+                                               "TOAtStart" = c(0, 1, 0, 3, 0)),
+                                    "PredictedADJNetPoints" = OwnTerritory_ADJNetPoints_V3SamplePrediction)
+view(OwnTerritoryADJNetV3SampleDF)
+
+OwnTerritory_ADJNetPoints_V3FullTestPrediction <- predict(OwnTerritory_ADJUSTEDNetLMV3, 
+                                                        newdata = data.frame("TimeAtStart" = rep(rep(1:120, each = 50), 4),
+                                                                             "FieldPos" = rep(rep(50:99, 120), 4), 
+                                                                             "TOAtStart" = rep(0:3, each = 6000)))
+
+OwnTerritory_ADJNetV3_FullTestDF <- cbind(data.frame("TimeAtStart" = rep(rep(1:120, each = 50), 4),
+                                                     "FieldPos" = rep(rep(50:99, 120), 4), 
+                                                     "TOAtStart" = rep(0:3, each = 6000)),
+                                      "PredictedADJNetPoints" = OwnTerritory_ADJNetPoints_V3FullTestPrediction)
+view(OwnTerritory_ADJNetV3_FullTestDF)
+
+OwnTerritory_NetPointDiff_V3SamplePrediction <- predict(OwnTerritory_NetPointDiff_LMV3, 
+                                                        newdata = data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                                                             "FieldPos" = c(90, 75, 80, 70, 65), 
+                                                                             "TOAtStart" = c(0, 1, 0, 3, 0)))
+
+OwnTerritory_NetPointDiff_V3SampleDF <- cbind(data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                                 "FieldPos" = c(90, 75, 80, 70, 65), 
+                                                 "TOAtStart" = c(0, 1, 0, 3, 0)),
+                                      "PredictedNetPointDiff" = OwnTerritory_NetPointDiff_V3SamplePrediction)
+view(OwnTerritory_NetPointDiff_V3SampleDF)
+
+OwnTerritory_NetPointDiff_V3FullTestPrediction <- predict(OwnTerritory_NetPointDiff_LMV3, 
+                                                          newdata = data.frame("TimeAtStart" = rep(rep(1:120, each = 50), 4),
+                                                                               "FieldPos" = rep(rep(50:99, 120), 4), 
+                                                                               "TOAtStart" = rep(0:3, each = 6000)))
+
+OwnTerritory_NetPointDiff_V3_FullTestDF <- cbind(data.frame("TimeAtStart" = rep(rep(1:120, each = 50), 4),
+                                                     "FieldPos" = rep(rep(50:99, 120), 4), 
+                                                     "TOAtStart" = rep(0:3, each = 6000)),
+                                          "PredictedNetPointDiff" = OwnTerritory_NetPointDiff_V3FullTestPrediction)
+view(OwnTerritory_NetPointDiff_V3_FullTestDF)
+
+# Also LM or GLM for theoretical kneeldown rate & quit rate
+KneeldownRateLinearModelV1 <- glm(FirstPlayKnee ~ TimeAtStart + FieldPos + TOAtStart - 1, 
+                                  family = gaussian, PointsScoredOnDriveTable) 
+OwnTerritory_KneeldownRateLMV1 <- glm(FirstPlayKnee ~ TimeAtStart + FieldPos + TOAtStart - 1, 
+                                      family = gaussian, PointsScoredOnDriveTable_OwnTerritory) 
+OwnTerritory_KneeldownRateLMV1$coefficients
+summary(OwnTerritory_KneeldownRateLMV1)$coefficients
+
+OwnTerritory_KneeldownRateLMV1Prediction <- predict(OwnTerritory_KneeldownRateLMV1, 
+                                                    newdata = PointsScoredOnDriveTable_OwnTerritory)
+
+OwnTerritory_KneeldownRateLMV1V1Error <- 
+  PointsScoredOnDriveTable_OwnTerritory$FirstPlayKnee - OwnTerritory_KneeldownRateLMV1Prediction
+
+OwnTerritory_KneeldownRateV1SamplePrediction <- predict(OwnTerritory_KneeldownRateLMV1, 
+                                                      newdata = data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                                                           "FieldPos" = c(90, 75, 80, 70, 65), 
+                                                                           "TOAtStart" = c(0, 1, 0, 3, 0)))
+
+OwnTerritory_KneeldownRateV1SampleDF <- cbind(data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                                       "FieldPos" = c(90, 75, 80, 70, 65), 
+                                                       "TOAtStart" = c(0, 1, 0, 3, 0)),
+                                            "PredictedKneelRate" = OwnTerritory_KneeldownRateV1SamplePrediction)
+view(OwnTerritory_KneeldownRateV1SampleDF)
+
+OwnTerritory_QuitRateGaussianINTLMV3 <- glm(QUIT ~ TimeAtStart + FieldPos + TOAtStart, 
+                                            family = gaussian, PointsScoredOnDriveTable_OwnTerritory) 
+OwnTerritory_QuitRateGaussianINTLMV3$coefficients
+summary(OwnTerritory_QuitRateGaussianINTLMV3)$coefficients
+
+OwnTerritory_QuitRateGaussianINTLMV3Prediction <- predict(OwnTerritory_QuitRateGaussianINTLMV3, 
+                                                          newdata = PointsScoredOnDriveTable_OwnTerritory)
+
+OwnTerritory_QuitRateGaussianINTLMV3Error <- 
+  PointsScoredOnDriveTable_OwnTerritory$QUIT - OwnTerritory_QuitRateGaussianINTLMV3Prediction
+
+PointsScoredOnDriveTable_OwnTerritory <- PointsScoredOnDriveTable_OwnTerritory %>%
+  mutate(OwnTerritory_QuitRateGaussianINTLMV3Prediction, OwnTerritory_QuitRateGaussianINTLMV3Error)
+
+OwnTerritory_QuitRateV3SamplePrediction <- predict(OwnTerritory_QuitRateGaussianINTLMV3, 
+                                                 newdata = data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                                                      "FieldPos" = c(90, 75, 80, 70, 65), 
+                                                                      "TOAtStart" = c(0, 1, 0, 3, 0)))
+
+OwnTerritory_QuitRateV3SampleDF <- cbind(data.frame("TimeAtStart" = c(10, 30, 60, 20, 5),
+                                                  "FieldPos" = c(90, 75, 80, 70, 65), 
+                                                  "TOAtStart" = c(0, 1, 0, 3, 0)),
+                                       "PredictedQuitRate" = OwnTerritory_QuitRateV3SamplePrediction)
+view(OwnTerritory_QuitRateV3SampleDF)
+
+OwnTerritory_QuitRate_V3FullTestPrediction <- predict(OwnTerritory_QuitRateGaussianINTLMV3, 
+                                                          newdata = data.frame("TimeAtStart" = rep(rep(1:120, each = 50), 4),
+                                                                               "FieldPos" = rep(rep(50:99, 120), 4), 
+                                                                               "TOAtStart" = rep(0:3, each = 6000)))
+
+OwnTerritory_QuitRate_FullTestDF <- cbind(data.frame("TimeAtStart" = rep(rep(1:120, each = 50), 4),
+                                                     "FieldPos" = rep(rep(50:99, 120), 4), 
+                                                     "TOAtStart" = rep(0:3, each = 6000)),
+                                          "PredictedQuitRate" = OwnTerritory_QuitRate_V3FullTestPrediction)
+view(OwnTerritory_QuitRate_FullTestDF)
+
+COMBINEDFullTestDF <- 
+  cbind(OwnTerritory_QuitRate_FullTestDF, OwnTerritory_ADJNetV3_FullTestDF$PredictedADJNetPoints)
+
+COMBINEDFullTestDF <- 
+  cbind(COMBINEDFullTestDF, OwnTerritory_NetPointDiff_V3_FullTestDF$PredictedNetPointDiff)
+
+FullTestColNames <- c("TimeAtStart", "FieldPos", "TOAtStart", 
+                      "PredictedQuitRate", "PredAdjNetPoints", "PredNetPointDiff")
+colnames(COMBINEDFullTestDF) <- FullTestColNames
+
+COMBINEDFullTestDF <- COMBINEDFullTestDF %>% 
+  mutate(Should_Off_Try_ADJNet = ifelse(PredAdjNetPoints > 0, TRUE, FALSE))
+
+COMBINEDFullTestDF <- COMBINEDFullTestDF %>% 
+  mutate(Do_Coaches_Usually_Try_To_Score = ifelse(PredictedQuitRate < 0.5, TRUE, FALSE))
+
+COMBINEDFullTestDF <- COMBINEDFullTestDF %>% 
+  mutate(Should_Off_Try_TRUEPointDiff = ifelse(PredNetPointDiff > 0, TRUE, FALSE))
+
+COMBINEDFullTestDF <- COMBINEDFullTestDF %>% 
+  mutate(GRAPHTimeouts = case_when(TOAtStart == 0 ~ "Timeouts = 0",
+                          TOAtStart == 1 ~ "Timeouts = 1",
+                          TOAtStart == 2 ~ "Timeouts = 2",
+                          TOAtStart == 3 ~ "Timeouts = 3"))
+
+sum(COMBINEDFullTestDF$Should_Off_Try_ADJNet)
+sum(COMBINEDFullTestDF$Should_Off_Try_TRUEPointDiff)
+sum(COMBINEDFullTestDF$Do_Coaches_Usually_Try_To_Score)
+
+ggplot(data = COMBINEDFullTestDF) + 
+  geom_point(mapping = aes(x = FieldPos, y = TimeAtStart, col = Should_Off_Try_ADJNet)) +
+  facet_wrap(~GRAPHTimeouts) +
+  labs(x = "Starting Field Pos", y = "Time At Start",
+       title = "When Should Coaches Try to Score Before Halftime?",
+       subtitle = "Based on 'ADJ Net Points' Formula, from 2009-2019",
+       caption = "Data from nflscrapR",
+       color = "Should Offense Try to Score?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.4),
+        plot.subtitle = element_text(size = 8, hjust = 0.4))
+
+ggplot(data = COMBINEDFullTestDF) + 
+  geom_point(mapping = aes(x = FieldPos, y = TimeAtStart, col = Should_Off_Try_TRUEPointDiff)) +
+  facet_wrap(~GRAPHTimeouts) +
+  labs(x = "Starting Field Pos", y = "Time At Start",
+       title = "When Should Coaches Try to Score Before Halftime?",
+       subtitle = "Based on Point Differential in Rest of Half, from 2009-2019",
+       caption = "Data from nflscrapR",
+       color = "Should Offense Try to Score?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.4),
+        plot.subtitle = element_text(size = 8, hjust = 0.4))
+
+ggplot(data = COMBINEDFullTestDF) + 
+  geom_point(mapping = aes(x = FieldPos, y = TimeAtStart, col = Do_Coaches_Usually_Try_To_Score)) +
+  facet_wrap(~GRAPHTimeouts) +
+  labs(x = "Starting Field Pos", y = "Time At Start",
+       title = "When Do Coaches Usually Try to Score Before Halftime?",
+       subtitle = "Based on 3,893 Drives to Occur from 2009-2019",
+       caption = "Data from nflscrapR",
+       color = "Do Coaches Usually Try to Score?") +
+  theme(plot.title = element_text(size = 10, hjust = 0.25),
+        plot.subtitle = element_text(size = 8, hjust = 0.25))
